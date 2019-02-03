@@ -92,6 +92,101 @@ foo(x) -> a
 }
 '''),
 
+('call-conds', True,
+r'''
+sum(x, y) -> a
+  ensure a = x + y
+{
+  a <- x + y;
+}
+
+foo(x, y) -> a
+  require x = sum(x, y + 1)
+  ensure a = -1
+{
+  a <- y;
+}
+
+bar(x, y) -> a
+{
+  if sum(x, y) = x - 1
+  {
+    if foo(x, y) = -1 {}
+    else
+    {
+      ensure false;
+    }
+  }
+}
+'''),
+
+('call-conds2', False,
+r'''
+sum(x, y) -> a
+  ensure a = x + y
+{
+  a <- x + y;
+}
+
+foo(x, y) -> a
+  require x = sum(x, y + 1)
+  ensure a = -1
+{
+  a <- y;
+}
+
+bar(x, y) -> a
+{
+  if sum(x, y) = x
+  {
+    if foo(x, y) = -1 {}
+    else
+    {
+      ensure false;
+    }
+  }
+}
+'''),
+
+('_call-conj', True,
+r'''
+foo(x) -> a
+  require x = 3
+{}
+
+bar(x) -> a
+{
+  if x = 3 /\ foo(x) = 0
+  {}
+}
+'''),
+
+('_call-disj', True,
+r'''
+foo(x) -> a
+  require x = 3
+{}
+
+bar(x) -> a
+{
+  if x <> 3 \/ foo(x) = 0
+  {}
+}
+'''),
+
+('_call-impl', True,
+r'''
+foo(x) -> a
+  require x = 3
+{}
+
+bar(x) -> a
+{
+  if x = 3 -> foo(x) = 0
+  {}
+}
+'''),
+
 ('high-branching', True,
 r'''
 foo(x) -> a
@@ -113,15 +208,22 @@ foo(x) -> a
 ]
 
 
-for name, expected, source in tests:
-  try:
-    compile(source)
-    if not expected:
-      print('\x1b[31mFAILED\x1b[0m ' + name + ' (expected error but succeeded)')
-      sys.exit(1)
-  except CompileError as e:
-    if expected:
-      print('\x1b[31mFAILED\x1b[0m ' + name + ':')
-      print(e.msg[:-1])
-      sys.exit(1)
-  print('\x1b[32mPASSED\x1b[0m ' + name)
+def runtests():
+  for name, expected, source in tests:
+    if name[0] == '_':
+      print('\x1b[33mSKIPPED\x1b[0m ' + name[1:])
+      continue
+    try:
+      compile(source)
+      if not expected:
+        print('\x1b[31mFAILED\x1b[0m ' + name + ' (expected error but succeeded)')
+        sys.exit(1)
+    except CompileError as e:
+      if expected:
+        print('\x1b[31mFAILED\x1b[0m ' + name + ':')
+        print(e.msg[:-1])
+        sys.exit(1)
+    print('\x1b[32mPASSED\x1b[0m ' + name)
+
+
+runtests()
