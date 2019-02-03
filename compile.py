@@ -57,13 +57,19 @@ class LocalContext:
     self.vars = {}
     self.knowledge = []
 
+    self.vars_stack = []
+    self.knowledge_stack = []
+
   def push(self):
-    # TODO: Could make this more efficient by referencing parent
-    cxt = LocalContext()
-    cxt.vals = list(self.vals)
-    cxt.vars = dict(self.vars)
-    cxt.knowledge = list(self.knowledge)
-    return cxt
+    self.vars_stack.append(dict(self.vars))
+    self.knowledge_stack.append(len(self.knowledge))
+
+  def pop(self):
+    self.vars = self.vars_stack.pop()
+    old_knowledge_len = self.knowledge_stack.pop()
+    new_knowledge = self.knowledge[old_knowledge_len:]
+    self.knowledge = self.knowledge[:old_knowledge_len]
+    return new_knowledge
 
   def val_name(self, name_hint):
     name = name_hint.upper()
@@ -111,7 +117,7 @@ class LocalContext:
     return s
 
 
-def interpret_iexpr(expr, cxt, global_context, subst={}):
+def interpret_iexpr(expr, ctx, global_context, subst={}):
   if expr.data == 'ilit':
     return z3.IntVal(int(str(expr[0])))
 
@@ -119,20 +125,20 @@ def interpret_iexpr(expr, cxt, global_context, subst={}):
     x = expr[0].value
     if x in subst:
       return subst[x]
-    if x not in cxt.vars:
+    if x not in ctx.vars:
       error('Undeclared variable', expr)
-    return cxt.vars[x]
+    return ctx.vars[x]
 
   elif expr.data == 'iunop':
-    i1 = interpret_iexpr(expr[1], cxt, global_context, subst)
+    i1 = interpret_iexpr(expr[1], ctx, global_context, subst)
     return {
       '+': i1,
       '-': -i1,
     }[str(expr[0])]
 
   elif expr.data == 'ibinop':
-    i1 = interpret_iexpr(expr[0], cxt, global_context, subst)
-    i2 = interpret_iexpr(expr[2], cxt, global_context, subst)
+    i1 = interpret_iexpr(expr[0], ctx, global_context, subst)
+    i2 = interpret_iexpr(expr[2], ctx, global_context, subst)
     return {
       '+': i1 + i2,
       '-': i1 - i2,
@@ -144,23 +150,23 @@ def interpret_iexpr(expr, cxt, global_context, subst={}):
       error('Undeclared function', expr)
     func = global_context[func]
 
-    args = [interpret_iexpr(arg, cxt, global_context, subst) for arg in expr.children[1:]]
+    args = [interpret_iexpr(arg, ctx, global_context, subst) for arg in expr.children[1:]]
     if len(func.params) != len(args):
       error('Wrong number of arguments', expr)
     psubst = {func.params[i].value: args[i] for i in range(len(func.params))}
 
     for pre in func.require:
-      cxt.prove(interpret_bexpr(pre, cxt, global_context, psubst), expr)
+      ctx.prove(interpret_bexpr(pre, ctx, global_context, psubst), expr)
 
-    psubst[func.ret.value] = cxt.new_val(func.name)
+    psubst[func.ret.value] = ctx.new_val(func.name)
     for post in func.ensure:
-      cxt.assume(interpret_bexpr(post, cxt, global_context, psubst))
+      ctx.assume(interpret_bexpr(post, ctx, global_context, psubst))
     return psubst[func.ret.value]
 
   raise NotImplementedError(expr)
 
 
-def interpret_bexpr(expr, cxt, global_context, subst={}):
+def interpret_bexpr(expr, ctx, global_context, subst={}):
   if expr.data == 'blit':
     return z3.BoolVal({
         'true': True,
@@ -169,11 +175,11 @@ def interpret_bexpr(expr, cxt, global_context, subst={}):
 
   elif expr.data == 'bunop':
     if str(expr[0]) == '~':
-      return z3.Not(interpret_bexpr(expr[1], cxt, global_context, subst))
+      return z3.Not(interpret_bexpr(expr[1], ctx, global_context, subst))
 
   elif expr.data == 'bbinop':
-    b1 = interpret_bexpr(expr[0], cxt, global_context, subst)
-    b2 = interpret_bexpr(expr[2], cxt, global_context, subst)
+    b1 = interpret_bexpr(expr[0], ctx, global_context, subst)
+    b2 = interpret_bexpr(expr[2], ctx, global_context, subst)
     return {
       '/\\': z3.And(b1, b2),
       '\\/': z3.Or(b1, b2),
@@ -184,8 +190,8 @@ def interpret_bexpr(expr, cxt, global_context, subst={}):
   elif expr.data == 'bicomp':
     exprs = []
     for i in range(0, len(expr.children) - 1, 2):
-      i1 = interpret_iexpr(expr[i], cxt, global_context, subst)
-      i2 = interpret_iexpr(expr[i + 2], cxt, global_context, subst)
+      i1 = interpret_iexpr(expr[i], ctx, global_context, subst)
+      i2 = interpret_iexpr(expr[i + 2], ctx, global_context, subst)
       exprs.append({
           '=': i1 == i2,
           '<>': i1 != i2,
@@ -199,93 +205,150 @@ def interpret_bexpr(expr, cxt, global_context, subst={}):
   raise NotImplementedError(expr)
 
 
-def interpret_block(stmts, cxt, global_context, posts):
+def get_top_level_blocks(stmt):
+  if stmt.data == 'if':
+    yield stmt['body'].children
+    for branch in stmt['elifs']:
+      yield branch['body'].children
+    for branch in stmt['else']:
+      yield branch.children
+  elif stmt.data == 'while':
+    assert False
+
+
+def get_modified_vars(stmts):
+  if type(stmts) is lark.Tree:
+    stmts = [stmts]
+
+  results = set()
+  for stmt in stmts:
+    if stmt.data == 'assign':
+      results.add(stmt['var'][0].value)
+    for block in get_top_level_blocks(stmt):
+      results.update(get_modified_vars(block))
+  return results
+
+
+def interpret_block(stmts, ctx, global_context, post):
   for i in range(len(stmts)):
     stmt = stmts[i]
 
     if stmt.data == 'ensure':
-      cxt.prove(interpret_bexpr(stmt['cond'][0], cxt, global_context), stmt)
+      ctx.prove(interpret_bexpr(stmt['cond'][0], ctx, global_context), stmt)
 
     elif stmt.data == 'assert':
-      cxt.assume(interpret_bexpr(stmt['cond'][0], cxt, global_context))
+      ctx.assume(interpret_bexpr(stmt['cond'][0], ctx, global_context))
 
     elif stmt.data == 'assign':
       x = stmt['var'][0].value
-      if x not in cxt.vars:
+      if x not in ctx.vars:
         error('Undeclared variable', stmt['var'])
-      cxt.vars[x] = interpret_iexpr(stmt['value'][0], cxt, global_context)
+      ctx.vars[x] = interpret_iexpr(stmt['value'][0], ctx, global_context)
 
     elif stmt.data == 'decl':
       for var in stmt:
         x = var.value
-        if x in cxt.vars:
+        if x in ctx.vars:
           error('Variable name already used', var)
-        cxt.vars[x] = cxt.new_val('?' + x)
+        ctx.vars[x] = ctx.new_val('?' + x)
 
     elif stmt.data == 'discard':
-      interpret_iexpr(stmt['value'][0], cxt, global_context)
+      interpret_iexpr(stmt['value'][0], ctx, global_context)
 
     elif stmt.data == 'return':
-      break
+      for p in post:
+        ctx.prove(interpret_bexpr(p, ctx, global_context), p)
+      ctx.assume(z3.BoolVal(False))
 
     elif stmt.data == 'if':
-      # Alternate approach:
-      # For each variable x assigned in bodies, create a new value X representing
-      # the value after the branch
-      # For each body, interpret with pushed condition assumptions C
-      # Check value x -> E and replace with x -> X and knowledge X = E
-      # Move knowledge back to original context, prefaced with C ->
-      # After all branches are done, learn x -> X
+      end_vals = {}
+      for x in get_modified_vars(stmt):
+        end_vals[x] = ctx.new_val('$' + x)
 
-      prevconds = []
+      def interpret_branch(cond, stmts):
+        ctx.push()
+        ctx.assume(cond)
+        interpret_block(stmts, ctx, global_context, post)
 
-      cxt0 = cxt.push()
-      cxt0.assume(interpret_bexpr(stmt['cond'][0], cxt0, global_context))
-      interpret_block(stmt['body'].children + stmts[i+1:], cxt0, global_context, posts)
-      prevconds.append(stmt['cond'][0])
+        for x, X in end_vals.items():
+          ctx.assume(X == ctx.vars[x])
+
+        if type(cond) is list:
+          cond = cond[0] if len(cond) == 1 else z3.And(cond)
+        for P in ctx.pop()[1:]:
+          ctx.assume(z3.Implies(cond, P))
+
+      neg_conds = []
+
+      cond = interpret_bexpr(stmt['cond'][0], ctx, global_context)
+      interpret_branch(cond, stmt['body'].children)
+      neg_conds.append(z3.Not(cond))
 
       for branch in stmt['elifs']:
-        cxt0 = cxt.push()
-        for cond in prevconds:
-          cxt0.assume(z3.Not(interpret_bexpr(cond, cxt0, global_context)))
-        cxt0.assume(interpret_bexpr(branch['cond'][0], cxt0, global_context))
-        interpret_block(branch['body'].children + stmts[i+1:], cxt0, global_context, posts)
-        prevconds.append(branch['cond'][0])
+        cond = interpret_bexpr(branch['cond'][0], ctx, global_context)
+        interpret_branch(neg_conds + [cond], branch['body'].children)
+        neg_conds.append(z3.Not(cond))
 
-      elsebody = [] if len(stmt['else'].children) == 0 else stmt['else'][0].children
-      cxt0 = cxt.push()
-      for cond in prevconds:
-        cxt0.assume(z3.Not(interpret_bexpr(cond, cxt0, global_context)))
-      interpret_block(elsebody + stmts[i+1:], cxt0, global_context, posts)
+      if len(stmt['else'].children) > 0:
+        interpret_branch(neg_conds, stmt['else'][0].children)
+      else:
+        interpret_branch(neg_conds, [])
 
-      return
+      for x, X in end_vals.items():
+        ctx.vars[x] = X
+
+      # prevconds = []
+
+      # ctx0 = ctx.push()
+      # ctx0.assume(interpret_bexpr(stmt['cond'][0], ctx0, global_context))
+      # interpret_block(stmt['body'].children + stmts[i+1:], ctx0, global_context, posts)
+      # prevconds.append(stmt['cond'][0])
+
+      # for branch in stmt['elifs']:
+      #   ctx0 = ctx.push()
+      #   for cond in prevconds:
+      #     ctx0.assume(z3.Not(interpret_bexpr(cond, ctx0, global_context)))
+      #   ctx0.assume(interpret_bexpr(branch['cond'][0], ctx0, global_context))
+      #   interpret_block(branch['body'].children + stmts[i+1:], ctx0, global_context, posts)
+      #   prevconds.append(branch['cond'][0])
+
+      # elsebody = [] if len(stmt['else'].children) == 0 else stmt['else'][0].children
+      # ctx0 = ctx.push()
+      # for cond in prevconds:
+      #   ctx0.assume(z3.Not(interpret_bexpr(cond, ctx0, global_context)))
+      # interpret_block(elsebody + stmts[i+1:], ctx0, global_context, posts)
+
+      # return
 
     else:
       raise NotImplementedError(stmt)
 
-  for post in posts:
-    cxt.prove(interpret_bexpr(post, cxt, global_context), post)
+  # for post in posts:
+  #   ctx.prove(interpret_bexpr(post, ctx, global_context), post)
 
 
 def check_function(func, global_context):
-  cxt = LocalContext()
+  ctx = LocalContext()
 
   for param in func.params:
     x = param.value
-    if x in cxt.vars:
+    if x in ctx.vars:
       error('Variable name already used', param)
-    cxt.vars[x] = cxt.new_val(x)
+    ctx.vars[x] = ctx.new_val(x)
 
   for pre in func.require:
-    cxt.assume(interpret_bexpr(pre, cxt, global_context))
+    ctx.assume(interpret_bexpr(pre, ctx, global_context))
 
   r = func.ret.value
-  if r in cxt.vars:
+  if r in ctx.vars:
     error('Variable name already used', func.ret)
-  cxt.vars[r] = cxt.new_val('?' + r)
-  # cxt.vars[r] = z3.IntVal(0)
+  ctx.vars[r] = ctx.new_val('?' + r)
+  # ctx.vars[r] = z3.IntVal(0)
 
-  interpret_block(func.body.children, cxt, global_context, func.ensure)
+  interpret_block(func.body.children, ctx, global_context, func.ensure)
+
+  for post in func.ensure:
+    ctx.prove(interpret_bexpr(post, ctx, global_context), post)
 
 
 def tree_get_child(self, key):

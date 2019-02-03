@@ -148,6 +148,8 @@ bar(x, y) -> a
 }
 '''),
 
+# These may not actually be correct
+
 ('_call-conj', True,
 r'''
 foo(x) -> a
@@ -187,12 +189,76 @@ bar(x) -> a
 }
 '''),
 
+('low-branching', True,
+r'''
+foo(x) -> a
+  require 0 <= x <= 1
+  ensure a = x
+{
+  if x = 0 { a <- 0; }
+  if x = 1 { a <- 1; }
+}
+'''),
+
+('branching-error', False,
+r'''
+foo(x) -> a
+  require 0 <= x <= 4
+  ensure a = x
+{
+  if x = 0 { a <- 0; }
+  if x = 1 { a <- 1; }
+  if x = 2 { a <- 3; }
+  if x = 3 { a <- 3; }
+  if x = 4 { a <- 4; }
+}
+'''),
+
+('branching-call', True,
+r'''
+max1(x, y) -> a
+  require x = 3 /\ y <= 3
+  ensure a >= x /\ a >= y
+  ensure a = x \/ a = y
+{
+  a <- 3;
+}
+
+max2(x, y) -> a
+  ensure a >= x /\ a >= y
+  ensure a = x \/ a = y
+{
+  if x <= y
+  {
+    a <- y;
+  }
+  else
+  {
+    a <- x;
+  }
+}
+
+foo(x, y) -> a
+  require x = 3
+{
+  if y <= x
+  {
+    a <- max1(x, y);
+  }
+  elif max2(x, y) = x
+  {
+    ensure false;
+  }
+}
+'''),
+
 ('high-branching', True,
 r'''
 foo(x) -> a
-  require 1 < x <= 9
+  require 0 <= x <= 9
   ensure a = x
 {
+  if x = 0 { a <- 0; }
   if x = 1 { a <- 1; }
   if x = 2 { a <- 2; }
   if x = 3 { a <- 3; }
