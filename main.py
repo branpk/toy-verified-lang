@@ -50,6 +50,14 @@ class LocalContext:
     self.vars = {}
     self.knowledge = []
 
+  def push(self):
+    # TODO: Could make this more efficient by referencing parent
+    cxt = LocalContext()
+    cxt.vals = list(self.vals)
+    cxt.vars = dict(self.vars)
+    cxt.knowledge = list(self.knowledge)
+    return cxt
+
   def val_name(self, name_hint):
     name = name_hint.upper()
     suffix = 0
@@ -64,7 +72,10 @@ class LocalContext:
     return z3.Int(name)
 
   def assume(self, formula):
-    self.knowledge.append(formula)
+    if type(formula) is list:
+      self.knowledge += formula
+    else:
+      self.knowledge.append(formula)
 
   def prove(self, formula, error_node):
     solver = z3.Solver()
@@ -181,6 +192,74 @@ def interpret_bexpr(expr, cxt, global_context, subst={}):
   raise NotImplementedError(expr)
 
 
+def interpret_block(stmts, cxt, global_context, posts):
+  for i in range(len(stmts)):
+    stmt = stmts[i]
+
+    if stmt.data == 'ensure':
+      cxt.prove(interpret_bexpr(stmt['cond'][0], cxt, global_context), stmt)
+
+    elif stmt.data == 'assert':
+      cxt.assume(interpret_bexpr(stmt['cond'][0], cxt, global_context))
+
+    elif stmt.data == 'assign':
+      x = stmt['var'][0].value
+      if x not in cxt.vars:
+        error('Undeclared variable', stmt['var'])
+      cxt.vars[x] = interpret_iexpr(stmt['value'][0], cxt, global_context)
+
+    elif stmt.data == 'decl':
+      for var in stmt:
+        x = var.value
+        if x in cxt.vars:
+          error('Variable name already used', var)
+        cxt.vars[x] = cxt.new_val('?' + x)
+
+    elif stmt.data == 'discard':
+      interpret_iexpr(stmt['value'][0], cxt, global_context)
+
+    elif stmt.data == 'return':
+      break
+
+    elif stmt.data == 'if':
+      # Alternate approach:
+      # For each variable x assigned in bodies, create a new value X representing
+      # the value after the branch
+      # For each body, interpret with pushed condition assumptions C
+      # Check value x -> E and replace with x -> X and knowledge X = E
+      # Move knowledge back to original context, prefaced with C ->
+      # After all branches are done, learn x -> X
+
+      negconds = []
+
+      cxt0 = cxt.push()
+      cond = interpret_bexpr(stmt['cond'][0], cxt, global_context)
+      cxt0.assume(cond)
+      interpret_block(stmt['body'].children + stmts[i+1:], cxt0, global_context, posts)
+      negconds.append(z3.Not(cond))
+
+      for branch in stmt['elifs']:
+        cxt0 = cxt.push()
+        cond = interpret_bexpr(branch['cond'][0], cxt, global_context)
+        cxt0.assume(negconds)
+        cxt0.assume(cond)
+        interpret_block(branch['body'].children + stmts[i+1:], cxt0, global_context, posts)
+        negconds.append(z3.Not(cond))
+
+      for branch in stmt['else']:
+        cxt0 = cxt.push()
+        cxt0.assume(negconds)
+        interpret_block(branch.children + stmts[i+1:], cxt0, global_context, posts)
+
+      return
+
+    else:
+      raise NotImplementedError(stmt)
+
+  for post in posts:
+    cxt.prove(interpret_bexpr(post, cxt, global_context), post)
+
+
 def check_function(func, global_context):
   cxt = LocalContext()
 
@@ -199,29 +278,7 @@ def check_function(func, global_context):
   cxt.vars[r] = cxt.new_val('?' + r)
   # cxt.vars[r] = z3.IntVal(0)
 
-  for stmt in func.body:
-    if stmt.data == 'ensure':
-      cxt.prove(interpret_bexpr(stmt['cond'][0], cxt, global_context), stmt)
-    elif stmt.data == 'assert':
-      cxt.assume(interpret_bexpr(stmt['cond'][0], cxt, global_context))
-    elif stmt.data == 'assign':
-      x = stmt['var'][0].value
-      if x not in cxt.vars:
-        error('Undeclared variable', stmt['var'])
-      cxt.vars[x] = interpret_iexpr(stmt['value'][0], cxt, global_context)
-    elif stmt.data == 'decl':
-      for var in stmt:
-        x = var.value
-        if x in cxt.vars:
-          error('Variable name already used', var)
-        cxt.vars[x] = cxt.new_val('?' + x)
-    elif stmt.data == 'discard':
-      interpret_iexpr(stmt['value'][0], cxt, global_context)
-    else:
-      raise NotImplementedError(stmt)
-
-  for post in func.ensure:
-    cxt.prove(interpret_bexpr(post, cxt, global_context), post)
+  interpret_block(func.body.children, cxt, global_context, func.ensure)
 
 
 def tree_get_child(self, key):
@@ -240,18 +297,26 @@ with open('grammar.lark', 'r') as f:
 
 
 source = r'''
-sum(x, y) -> z
-  ensure z = x + y
+max(x, y) -> z
+  ensure z >= x /\ z >= y
+  ensure z = x \/ z = y
+  ensure x >= y -> z = x
+  ensure y >= x -> z = y
 {
-  z <- x + y;
-}
-
-foo(x, y) -> a
-  ensure a = x - y
-  ensure a >= 0
-{
-  assert x >= y;
-  a <- sum(x, -y);
+  if x > y
+  {
+    z <- x - 1;
+  }
+  elif x = y
+  {
+    z <- x;
+    return;
+  }
+  else
+  {
+    z <- y - 1;
+  }
+  z <- z + 1;
 }
 '''
 ast = parser.parse(source)
