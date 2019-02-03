@@ -34,7 +34,7 @@ class Function:
 
   def __init__(self, decl):
     self.name = decl['name'][0]
-    self.params = decl['params']
+    self.params = decl['params'].children
     self.ret = decl['ret'][0]
 
     self.require = [r['cond'][0] for r in decl['reqs'].children if r.data == 'require']
@@ -63,6 +63,9 @@ class LocalContext:
     self.vals.append(name)
     return z3.Int(name)
 
+  def assume(self, formula):
+    self.knowledge.append(formula)
+
   def prove(self, formula, error_node):
     solver = z3.Solver()
     for hyp in self.knowledge:
@@ -90,53 +93,81 @@ class LocalContext:
     return s
 
 
-def interpret_iexpr(expr, cxt, global_context):
+def interpret_iexpr(expr, cxt, global_context, subst={}):
   if expr.data == 'ilit':
     return z3.IntVal(int(str(expr[0])))
+
   elif expr.data == 'ivar':
-    x = str(expr[0])
+    x = expr[0].value
+    if x in subst:
+      return subst[x]
     if x not in cxt.vars:
       error('Undeclared variable', expr)
     return cxt.vars[x]
+
   elif expr.data == 'iunop':
-    i1 = interpret_iexpr(expr[1], cxt, global_context)
+    i1 = interpret_iexpr(expr[1], cxt, global_context, subst)
     return {
       '+': i1,
       '-': -i1,
     }[str(expr[0])]
+
   elif expr.data == 'ibinop':
-    i1 = interpret_iexpr(expr[0], cxt, global_context)
-    i2 = interpret_iexpr(expr[2], cxt, global_context)
+    i1 = interpret_iexpr(expr[0], cxt, global_context, subst)
+    i2 = interpret_iexpr(expr[2], cxt, global_context, subst)
     return {
       '+': i1 + i2,
       '-': i1 - i2,
     }[str(expr[1])]
+
+  elif expr.data == 'icall':
+    func = expr[0].value
+    if func not in global_context:
+      error('Undeclared function', expr)
+    func = global_context[func]
+
+    args = [interpret_iexpr(arg, cxt, global_context, subst) for arg in expr.children[1:]]
+    if len(func.params) != len(args):
+      error('Wrong number of arguments', expr)
+    psubst = {func.params[i].value: args[i] for i in range(len(func.params))}
+
+    for pre in func.require:
+      cxt.prove(interpret_bexpr(pre, cxt, global_context, psubst), expr)
+
+    psubst[func.ret.value] = cxt.new_val(func.name)
+    for post in func.ensure:
+      cxt.assume(interpret_bexpr(post, cxt, global_context, psubst))
+    return psubst[func.ret.value]
+
   raise NotImplementedError(expr)
 
 
-def interpret_bexpr(expr, cxt, global_context):
+def interpret_bexpr(expr, cxt, global_context, subst={}):
   if expr.data == 'blit':
     return z3.BoolVal({
         'true': True,
         'false': False,
       }[str(expr[0])])
+
   elif expr.data == 'bunop':
     if str(expr[0]) == '~':
-      return z3.Not(interpret_bexpr(expr[1], cxt, global_context))
+      return z3.Not(interpret_bexpr(expr[1], cxt, global_context, subst))
+
   elif expr.data == 'bbinop':
-    b1 = interpret_bexpr(expr[0], cxt, global_context)
-    b2 = interpret_bexpr(expr[2], cxt, global_context)
+    b1 = interpret_bexpr(expr[0], cxt, global_context, subst)
+    b2 = interpret_bexpr(expr[2], cxt, global_context, subst)
     return {
       '/\\': z3.And(b1, b2),
       '\\/': z3.Or(b1, b2),
       '->': z3.Implies(b1, b2),
       '<->': b1 == b2,
     }[str(expr[1])]
+
   elif expr.data == 'bicomp':
     exprs = []
     for i in range(0, len(expr.children) - 1, 2):
-      i1 = interpret_iexpr(expr[i], cxt, global_context)
-      i2 = interpret_iexpr(expr[i + 2], cxt, global_context)
+      i1 = interpret_iexpr(expr[i], cxt, global_context, subst)
+      i2 = interpret_iexpr(expr[i + 2], cxt, global_context, subst)
       exprs.append({
           '=': i1 == i2,
           '<>': i1 != i2,
@@ -146,6 +177,7 @@ def interpret_bexpr(expr, cxt, global_context):
           '>': i1 > i2,
         }[str(expr[i + 1])])
     return exprs[0] if len(exprs) == 1 else z3.And(exprs)
+
   raise NotImplementedError(expr)
 
 
@@ -159,7 +191,7 @@ def check_function(func, global_context):
     cxt.vars[x] = cxt.new_val(x)
 
   for pre in func.require:
-    cxt.knowledge.append(interpret_bexpr(pre, cxt, global_context))
+    cxt.assume(interpret_bexpr(pre, cxt, global_context))
 
   r = func.ret.value
   if r in cxt.vars:
@@ -171,7 +203,7 @@ def check_function(func, global_context):
     if stmt.data == 'ensure':
       cxt.prove(interpret_bexpr(stmt['cond'][0], cxt, global_context), stmt)
     elif stmt.data == 'assert':
-      cxt.knowledge.append(interpret_bexpr(stmt['cond'][0], cxt, global_context))
+      cxt.assume(interpret_bexpr(stmt['cond'][0], cxt, global_context))
     elif stmt.data == 'assign':
       x = stmt['var'][0].value
       if x not in cxt.vars:
@@ -183,6 +215,8 @@ def check_function(func, global_context):
         if x in cxt.vars:
           error('Variable name already used', var)
         cxt.vars[x] = cxt.new_val('?' + x)
+    elif stmt.data == 'discard':
+      interpret_iexpr(stmt['value'][0], cxt, global_context)
     else:
       raise NotImplementedError(stmt)
 
@@ -209,14 +243,15 @@ source = r'''
 sum(x, y) -> z
   ensure z = x + y
 {
-  z <- y + x;
+  z <- x + y;
 }
 
 foo(x, y) -> a
-  require x = 4
-  ensure a > x
+  ensure a = x - y
+  ensure a >= 0
 {
-  a <- sum(x, 3);
+  assert x >= y;
+  a <- sum(x, -y);
 }
 '''
 ast = parser.parse(source)
@@ -225,7 +260,7 @@ global_context = {}
 for decl in ast.children:
   func = Function(decl)
   check_function(func, global_context)
-  print('Verified ' + func.name)
+  print('Verified function: ' + func.name)
   global_context[func.name] = func
 
 

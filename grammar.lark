@@ -19,6 +19,7 @@ _block: "{" stmt* "}"
      | "return" ";" -> return
      | "if" cond body ifelifs ifelse -> if
      | "while" cond whilereqs body -> while
+     | value ";" -> discard
 
 whilereqs: whilereq* -> reqs
 ?whilereq: "ensure" cond -> ensure | "decrease" value -> decrease
