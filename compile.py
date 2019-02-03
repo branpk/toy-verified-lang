@@ -4,6 +4,12 @@ import lark
 import z3
 
 
+class CompileError(BaseException):
+
+  def __init__(self, msg):
+    self.msg = msg
+
+
 def get_line(node):
   try:
     if node.line is not None:
@@ -23,11 +29,12 @@ def get_column(node):
 def error(err, node):
   line = get_line(node)
   column = get_column(node)
-  print('Error at %d:%d:' % (line, column))
-  print('  ' + source.split('\n')[line - 1])
-  print('  ' + ' '*(column - 1) + '^')
-  print(err)
-  sys.exit(1)
+  e = ''
+  e += 'Error at %d:%d:\n' % (line, column)
+  e += '  ' + source.split('\n')[line - 1] + '\n'
+  e += '  ' + ' '*(column - 1) + '^\n'
+  e += err + '\n'
+  raise CompileError(e)
 
 
 class Function:
@@ -230,26 +237,26 @@ def interpret_block(stmts, cxt, global_context, posts):
       # Move knowledge back to original context, prefaced with C ->
       # After all branches are done, learn x -> X
 
-      negconds = []
+      prevconds = []
 
       cxt0 = cxt.push()
-      cond = interpret_bexpr(stmt['cond'][0], cxt, global_context)
-      cxt0.assume(cond)
+      cxt0.assume(interpret_bexpr(stmt['cond'][0], cxt0, global_context))
       interpret_block(stmt['body'].children + stmts[i+1:], cxt0, global_context, posts)
-      negconds.append(z3.Not(cond))
+      prevconds.append(stmt['cond'][0])
 
       for branch in stmt['elifs']:
         cxt0 = cxt.push()
-        cond = interpret_bexpr(branch['cond'][0], cxt, global_context)
-        cxt0.assume(negconds)
-        cxt0.assume(cond)
+        for cond in prevconds:
+          cxt0.assume(z3.Not(interpret_bexpr(cond, cxt0, global_context)))
+        cxt0.assume(interpret_bexpr(branch['cond'][0], cxt0, global_context))
         interpret_block(branch['body'].children + stmts[i+1:], cxt0, global_context, posts)
-        negconds.append(z3.Not(cond))
+        prevconds.append(branch['cond'][0])
 
-      for branch in stmt['else']:
-        cxt0 = cxt.push()
-        cxt0.assume(negconds)
-        interpret_block(branch.children + stmts[i+1:], cxt0, global_context, posts)
+      elsebody = [] if len(stmt['else'].children) == 0 else stmt['else'][0].children
+      cxt0 = cxt.push()
+      for cond in prevconds:
+        cxt0.assume(z3.Not(interpret_bexpr(cond, cxt0, global_context)))
+      interpret_block(elsebody + stmts[i+1:], cxt0, global_context, posts)
 
       return
 
@@ -296,37 +303,17 @@ with open('grammar.lark', 'r') as f:
   parser = lark.Lark(f.read())
 
 
-source = r'''
-max(x, y) -> z
-  ensure z >= x /\ z >= y
-  ensure z = x \/ z = y
-  ensure x >= y -> z = x
-  ensure y >= x -> z = y
-{
-  if x > y
-  {
-    z <- x - 1;
-  }
-  elif x = y
-  {
-    z <- x;
-    return;
-  }
-  else
-  {
-    z <- y - 1;
-  }
-  z <- z + 1;
-}
-'''
-ast = parser.parse(source)
+def compile(src):
+  global source
+  source = src
 
-global_context = {}
-for decl in ast.children:
-  func = Function(decl)
-  check_function(func, global_context)
-  print('Verified function: ' + func.name)
-  global_context[func.name] = func
+  ast = parser.parse(source)
+
+  global_context = {}
+  for decl in ast.children:
+    func = Function(decl)
+    check_function(func, global_context)
+    global_context[func.name] = func
 
 
 # Context:
