@@ -9,7 +9,7 @@ except ImportError:
   pass
 
 
-tests = \
+all_tests = \
 [
 
 ('sum', True,
@@ -55,8 +55,10 @@ max(x, y) -> a
   }
   else
   {
+    ensure x < y;
     a <- y - 1;
   }
+  ensure x <> y;
   a <- a + 1;
 }
 '''),
@@ -271,10 +273,164 @@ foo(x) -> a
 }
 '''),
 
+('scope', False,
+r'''
+foo(x) -> a
+  require x <= 10
+  ensure a = 10
+{
+  if x < 5
+  {
+    var z;
+    z <- x + 1;
+    x <- z;
+  }
+  a <- z;
+}
+'''),
+
+('scope2', True,
+r'''
+foo(x) -> a
+  require x <= 10
+{
+  if x < 5
+  {
+    var z;
+    z <- x + 1;
+    x <- z;
+  }
+  else
+  {
+    var z;
+    z <- x - 1;
+    x <- z;
+  }
+  a <- x;
+}
+'''),
+
+('loop', True,
+r'''
+foo(x) -> a
+  require x <= 5
+  ensure a = 10
+{
+  while x <> 10
+    ensure x <= 10
+  {
+    x <- x + 1;
+  }
+  a <- x;
+}
+'''),
+
+('loop-inv-0', False,
+r'''
+foo(x) -> a
+  require x <= 10
+{
+  while x <> 5
+    ensure x < 5
+  {
+    x <- x + 1;
+  }
+}
+'''),
+
+('loop-inv-1', False,
+r'''
+foo(x) -> a
+  require x < 5
+{
+  while x <= 5
+    ensure x < 5
+  {
+    x <- x + 1;
+  }
+}
+'''),
+
+('loop2', False,
+r'''
+foo(x) -> a
+  require x < 5
+  ensure x > 5
+{
+  while x < 5
+    ensure x <= 5
+  {
+    x <- x + 1;
+  }
+}
+'''),
+
+('loop3', False,
+r'''
+foo(x) -> a
+  require x < 5
+  ensure a >= 5
+{
+  a <- x;
+  while a < 5
+  {
+    a <- a + 1;
+  }
+  ensure a = 5;
+}
+'''),
+
+('loop4', True,
+r'''
+foo(x) -> a
+  require x < 10
+  ensure a = 10
+{
+  while x < 10
+    ensure x <= 10
+  {
+    x <- x + 1;
+    if x = 5
+    {
+      a <- 10;
+      x <- 100;
+      return;
+    }
+    ensure x <= 10;
+  }
+  a <- x;
+}
+'''),
+
+# TODO: If this is implemented, add tests for function calls in condition
+('_loop-unroll-0', True,
+r'''
+foo(x) -> a
+{
+  x <- 10;
+  while x < 5
+    ensure x <= 5
+  {
+    x <- x + 1;
+  }
+  ensure x = 2;
+}
+'''),
+
+('mutate-param', False,
+r'''
+foo(x) -> a
+  ensure a = x
+{
+  a <- 0;
+  x <- 0;
+}
+'''),
+
 ]
 
 
-def runtests():
+def run_tests(tests):
   for name, expected, source in tests:
     if name[0] == '_':
       print('\x1b[33mSKIPPED\x1b[0m ' + name[1:])
@@ -292,4 +448,14 @@ def runtests():
     print('\x1b[32mPASSED\x1b[0m ' + name)
 
 
-runtests()
+if len(sys.argv) > 1:
+  tests = []
+  for name in sys.argv[1:]:
+    test = [t for t in all_tests if t[0] == name]
+    if len(test) == 0:
+      print('No such test: ' + name)
+      sys.exit(1)
+    tests += test
+else:
+  tests = all_tests
+run_tests(tests)

@@ -37,6 +37,22 @@ def error(err, node):
   raise CompileError(e)
 
 
+def flatten(x):
+  try:
+    return sum(map(flatten, x), [])
+  except:
+    return [x]
+
+def z3_and(p):
+  p = flatten(p)
+  if len(p) == 0:
+    return z3.BoolVal(True)
+  elif len(p) == 1:
+    return p[0]
+  else:
+    return z3.And(p)
+
+
 class Function:
 
   def __init__(self, decl):
@@ -200,7 +216,7 @@ def interpret_bexpr(expr, ctx, global_context, subst={}):
           '>=': i1 >= i2,
           '>': i1 > i2,
         }[str(expr[i + 1])])
-    return exprs[0] if len(exprs) == 1 else z3.And(exprs)
+    return z3_and(exprs)
 
   raise NotImplementedError(expr)
 
@@ -213,7 +229,7 @@ def get_top_level_blocks(stmt):
     for branch in stmt['else']:
       yield branch.children
   elif stmt.data == 'while':
-    assert False
+    yield stmt['body'].children
 
 
 def get_modified_vars(stmts):
@@ -227,6 +243,93 @@ def get_modified_vars(stmts):
     for block in get_top_level_blocks(stmt):
       results.update(get_modified_vars(block))
   return results
+
+
+def interpret_if_stmt(stmt, ctx, global_context, post):
+  end_vals = {}
+  for x in get_modified_vars(stmt):
+    if x in ctx.vars:
+      end_vals[x] = ctx.new_val('$' + x)
+
+  def interpret_branch(cond, stmts):
+    ctx.push()
+    ctx.assume(cond)
+    interpret_block(stmts, ctx, global_context, post)
+
+    for x, X in end_vals.items():
+      ctx.assume(X == ctx.vars[x])
+
+    if type(cond) is list:
+      cond = z3_and(cond)
+    for P in ctx.pop()[1:]:
+      ctx.assume(z3.Implies(cond, P))
+
+  neg_conds = []
+
+  cond = interpret_bexpr(stmt['cond'][0], ctx, global_context)
+  interpret_branch(cond, stmt['body'].children)
+  neg_conds.append(z3.Not(cond))
+
+  for branch in stmt['elifs']:
+    cond = interpret_bexpr(branch['cond'][0], ctx, global_context)
+    interpret_branch(neg_conds + [cond], branch['body'].children)
+    neg_conds.append(z3.Not(cond))
+
+  if len(stmt['else'].children) > 0:
+    interpret_branch(neg_conds, stmt['else'][0].children)
+  else:
+    interpret_branch(neg_conds, [])
+
+  for x, X in end_vals.items():
+    ctx.vars[x] = X
+
+  # prevconds = []
+
+  # ctx0 = ctx.push()
+  # ctx0.assume(interpret_bexpr(stmt['cond'][0], ctx0, global_context))
+  # interpret_block(stmt['body'].children + stmts[i+1:], ctx0, global_context, posts)
+  # prevconds.append(stmt['cond'][0])
+
+  # for branch in stmt['elifs']:
+  #   ctx0 = ctx.push()
+  #   for cond in prevconds:
+  #     ctx0.assume(z3.Not(interpret_bexpr(cond, ctx0, global_context)))
+  #   ctx0.assume(interpret_bexpr(branch['cond'][0], ctx0, global_context))
+  #   interpret_block(branch['body'].children + stmts[i+1:], ctx0, global_context, posts)
+  #   prevconds.append(branch['cond'][0])
+
+  # elsebody = [] if len(stmt['else'].children) == 0 else stmt['else'][0].children
+  # ctx0 = ctx.push()
+  # for cond in prevconds:
+  #   ctx0.assume(z3.Not(interpret_bexpr(cond, ctx0, global_context)))
+  # interpret_block(elsebody + stmts[i+1:], ctx0, global_context, posts)
+
+  # return
+
+
+def interpret_while_stmt(stmt, ctx, global_context, post):
+  invs = [r['cond'][0] for r in stmt['reqs'] if r.data == 'ensure']
+
+  for inv in invs:
+    ctx.prove(interpret_bexpr(inv, ctx, global_context), inv)
+
+  for x in get_modified_vars(stmt):
+    if x in ctx.vars:
+      ctx.vars[x] = ctx.new_val('$' + x)
+
+  for inv in invs:
+    ctx.assume(interpret_bexpr(inv, ctx, global_context))
+
+  cond = interpret_bexpr(stmt['cond'][0], ctx, global_context)
+
+  ctx.push()
+  ctx.assume(cond)
+  interpret_block(stmt['body'].children, ctx, global_context, post)
+  for inv in invs:
+    ctx.prove(interpret_bexpr(inv, ctx, global_context), inv)
+  ctx.pop()
+
+  ctx.assume(z3.Not(cond))
 
 
 def interpret_block(stmts, ctx, global_context, post):
@@ -256,85 +359,29 @@ def interpret_block(stmts, ctx, global_context, post):
       interpret_iexpr(stmt['value'][0], ctx, global_context)
 
     elif stmt.data == 'return':
-      for p in post:
-        ctx.prove(interpret_bexpr(p, ctx, global_context), p)
+      post()
       ctx.assume(z3.BoolVal(False))
 
     elif stmt.data == 'if':
-      end_vals = {}
-      for x in get_modified_vars(stmt):
-        end_vals[x] = ctx.new_val('$' + x)
+      interpret_if_stmt(stmt, ctx, global_context, post)
 
-      def interpret_branch(cond, stmts):
-        ctx.push()
-        ctx.assume(cond)
-        interpret_block(stmts, ctx, global_context, post)
-
-        for x, X in end_vals.items():
-          ctx.assume(X == ctx.vars[x])
-
-        if type(cond) is list:
-          cond = cond[0] if len(cond) == 1 else z3.And(cond)
-        for P in ctx.pop()[1:]:
-          ctx.assume(z3.Implies(cond, P))
-
-      neg_conds = []
-
-      cond = interpret_bexpr(stmt['cond'][0], ctx, global_context)
-      interpret_branch(cond, stmt['body'].children)
-      neg_conds.append(z3.Not(cond))
-
-      for branch in stmt['elifs']:
-        cond = interpret_bexpr(branch['cond'][0], ctx, global_context)
-        interpret_branch(neg_conds + [cond], branch['body'].children)
-        neg_conds.append(z3.Not(cond))
-
-      if len(stmt['else'].children) > 0:
-        interpret_branch(neg_conds, stmt['else'][0].children)
-      else:
-        interpret_branch(neg_conds, [])
-
-      for x, X in end_vals.items():
-        ctx.vars[x] = X
-
-      # prevconds = []
-
-      # ctx0 = ctx.push()
-      # ctx0.assume(interpret_bexpr(stmt['cond'][0], ctx0, global_context))
-      # interpret_block(stmt['body'].children + stmts[i+1:], ctx0, global_context, posts)
-      # prevconds.append(stmt['cond'][0])
-
-      # for branch in stmt['elifs']:
-      #   ctx0 = ctx.push()
-      #   for cond in prevconds:
-      #     ctx0.assume(z3.Not(interpret_bexpr(cond, ctx0, global_context)))
-      #   ctx0.assume(interpret_bexpr(branch['cond'][0], ctx0, global_context))
-      #   interpret_block(branch['body'].children + stmts[i+1:], ctx0, global_context, posts)
-      #   prevconds.append(branch['cond'][0])
-
-      # elsebody = [] if len(stmt['else'].children) == 0 else stmt['else'][0].children
-      # ctx0 = ctx.push()
-      # for cond in prevconds:
-      #   ctx0.assume(z3.Not(interpret_bexpr(cond, ctx0, global_context)))
-      # interpret_block(elsebody + stmts[i+1:], ctx0, global_context, posts)
-
-      # return
+    elif stmt.data == 'while':
+      interpret_while_stmt(stmt, ctx, global_context, post)
 
     else:
       raise NotImplementedError(stmt)
-
-  # for post in posts:
-  #   ctx.prove(interpret_bexpr(post, ctx, global_context), post)
 
 
 def check_function(func, global_context):
   ctx = LocalContext()
 
+  params = {}
   for param in func.params:
     x = param.value
     if x in ctx.vars:
       error('Variable name already used', param)
-    ctx.vars[x] = ctx.new_val(x)
+    params[x] = ctx.new_val(x)
+    ctx.vars[x] = params[x]
 
   for pre in func.require:
     ctx.assume(interpret_bexpr(pre, ctx, global_context))
@@ -345,10 +392,16 @@ def check_function(func, global_context):
   ctx.vars[r] = ctx.new_val('?' + r)
   # ctx.vars[r] = z3.IntVal(0)
 
-  interpret_block(func.body.children, ctx, global_context, func.ensure)
+  def check_post():
+    ctx.push()
+    ctx.vars = {r: ctx.vars[r]}
+    ctx.vars.update(params)
+    for post in func.ensure:
+      ctx.prove(interpret_bexpr(post, ctx, global_context), post)
+    ctx.pop()
 
-  for post in func.ensure:
-    ctx.prove(interpret_bexpr(post, ctx, global_context), post)
+  interpret_block(func.body.children, ctx, global_context, check_post)
+  check_post()
 
 
 def tree_get_child(self, key):
@@ -377,32 +430,3 @@ def compile(src):
     func = Function(decl)
     check_function(func, global_context)
     global_context[func.name] = func
-
-
-# Context:
-#   set of vals (X, Y, ...)
-#   set of vars (x, y, ...)
-#   knowledge about vals (X + Y = 3, Y <= X, ...)
-#   knowledge about vars (x -> X, y -> X + Y)
-#
-# Code without control structures
-# - Introduce new vars at declarations
-# - Introduce new vals at start for params and at function calls
-# For now, ignore calls in conditions
-# Handle while loops ignoring decrease and calls in cond
-# - Before loop:
-#   - Establish invariants
-#   - Forget knowledge about vars that are assigned in loop
-# - For each iteration:
-#   - Introduce values for vars at start of loop
-#   - Assume invariant
-#   - Assume cond is true
-#   - Execute body
-#   - Ensure invariant holds
-# - After loop has ended:
-#   - Introduce values for vars after loop has ended
-#   - Translate invariants to use these values
-#   - Assume cond is false
-# Handle while loop with call in cond
-# Handle if statements
-# Handle while loop decrease
